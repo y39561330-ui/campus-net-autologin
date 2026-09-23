@@ -1,0 +1,24 @@
+# ---------- 运行时产物（千万不要提交，里面有加密后的密码）----------
+config.json
+*.log
+log.txt
+
+# ---------- 本地备份 / 临时文件 ----------
+*.zip
+*.bak
+*.bak-*
+backup-*.bin
+hosts-backup-*.txt
+work/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+*.tmp
+
+# ---------- 打包产物 ----------
+dist/
+release/
