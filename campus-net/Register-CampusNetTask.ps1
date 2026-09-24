@@ -17,6 +17,8 @@ param(
     [int]$BootIntervalMinutes = 10,
     [string]$BootTaskName = 'CampusNetAutoLoginBoot',
     [string]$ExtraArguments = '',
+    [switch]$WatcherMode,             # 让任务拉起"常驻守护进程"（自愈），而不是只认证一次
+    [int]$LogonDelaySeconds = 2,      # 登录后多久触发（越小越快，脚本自己会重试到网络就绪）
     [int]$IntervalMinutes = 10,
     [string]$TaskName = 'CampusNetAutoLogin',
     [switch]$Remove
@@ -44,20 +46,46 @@ try {
         exit 1
     }
 
+    # 守护模式：任务拉起的是常驻进程（脚本内部有单例互斥，重复触发不会产生多个守护进程）
+    $launchArgs = $ExtraArguments
+    if ($WatcherMode) {
+        $launchArgs = ('-Watch -TimeoutMinutes 2 -IntervalSeconds 5 ' + $launchArgs).Trim()
+    }
+
     # 优先用 wscript + RunHidden.vbs（无窗口）
     $useLauncher = ($LauncherPath -and (Test-Path -LiteralPath $LauncherPath))
     if ($useLauncher) {
         $action = New-ScheduledTaskAction -Execute 'wscript.exe' `
-                    -Argument ('//B //Nologo "{0}" {1}' -f $LauncherPath, $ExtraArguments).Trim()
+                    -Argument ('//B //Nologo "{0}" {1}' -f $LauncherPath, $launchArgs).Trim()
     } else {
         $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-                    -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" {1}' -f $ScriptPath, $ExtraArguments).Trim()
+                    -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" {1}' -f $ScriptPath, $launchArgs).Trim()
     }
 
     $tLogon = New-ScheduledTaskTrigger -AtLogOn
-    $tLogon.Delay = 'PT5S'   # 登录后 5 秒就开始，脚本自己会重试到网络就绪
+    $tLogon.Delay = ('PT{0}S' -f [Math]::Max(1, $LogonDelaySeconds))
 
     $triggers = @($tLogon)
+
+    # 锁屏解锁：晚上锁屏、早上一解锁就立刻检查（登录触发器不会因为解锁而触发）
+    try {
+        $cimUnlock = Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace Root/Microsoft/Windows/TaskScheduler -ErrorAction Stop
+        $tUnlock = New-CimInstance -CimClass $cimUnlock -ClientOnly -Property @{ Enabled = $true; StateChange = 8 }  # 8 = SessionUnlock
+        $triggers += $tUnlock
+    } catch {
+        Write-Host "  （解锁触发器没加上，不影响使用：$($_.Exception.Message)）" -ForegroundColor DarkGray
+    }
+
+    # 睡眠唤醒：合盖 / 睡眠后自动回来（Kernel-Power 事件 107 = 从睡眠恢复）
+    try {
+        $cimEvent = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler -ErrorAction Stop
+        $sub = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-Kernel-Power''] and EventID=107]]</Select></Query></QueryList>'
+        $tResume = New-CimInstance -CimClass $cimEvent -ClientOnly -Property @{ Enabled = $true; Subscription = $sub }
+        $triggers += $tResume
+    } catch {
+        Write-Host "  （睡眠唤醒触发器没加上，不影响使用：$($_.Exception.Message)）" -ForegroundColor DarkGray
+    }
+
     if ($IntervalMinutes -gt 0) {
         $tRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
                     -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
@@ -91,6 +119,14 @@ try {
         $bootStart = New-ScheduledTaskTrigger -AtStartup
         try { $bootStart.Delay = 'PT10S' } catch { }
         $bootTriggers = @($bootStart)
+
+        # 睡眠唤醒（SYSTEM 侧）：锁屏状态下合盖/睡眠再打开也能自动恢复联网
+        try {
+            $cimEventBoot = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler -ErrorAction Stop
+            $subBoot = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-Kernel-Power''] and EventID=107]]</Select></Query></QueryList>'
+            $bootTriggers += New-CimInstance -CimClass $cimEventBoot -ClientOnly -Property @{ Enabled = $true; Subscription = $subBoot }
+        } catch { }
+
         if ($BootIntervalMinutes -gt 0) {
             $bootRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(4) `
                             -RepetitionInterval (New-TimeSpan -Minutes $BootIntervalMinutes) `

@@ -35,6 +35,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$script:CnVersion = '1.1.0'
+
 # ---------- 定位配置文件 ----------
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
@@ -213,15 +215,21 @@ function Get-NetCandidateList {
 }
 
 # ---------- 联网检测 ----------
-# 注意：不要用 generate_204 / msftncsi / captive.apple.com 这类探测地址，
-# 学校网关把它们放进了 visit_blacklist（免重定向名单），未认证时也可能返回正常结果。
+# 两个要点：
+#  1) 不要用 generate_204 / msftncsi / captive.apple.com 这类探测地址 —— 学校网关把它们
+#     放进了 visit_blacklist（免重定向名单），未认证时也可能返回正常结果。
+#  2) 光判断"返回 200 且内容够长"不够：网关拦截未认证流量时可能返回一个 200 的门户页，
+#     会被误判成"已经在线"从而跳过认证 —— 表现就是"进了桌面还要自己手动连一次"。
+#     所以再加两道校验：内容特征 + 门户页面识别。
 function Test-InternetOnline {
     param([int]$TimeoutSec = 8)
     $targets = @(
-        [pscustomobject]@{ Url = 'https://www.bing.com';  Code = 200; MinLen = 5000 },
-        [pscustomobject]@{ Url = 'https://www.qq.com';    Code = 200; MinLen = 1000 },
-        [pscustomobject]@{ Url = 'https://www.baidu.com'; Code = 200; MinLen = 100 }
+        [pscustomobject]@{ Url = 'https://www.bing.com';  Code = 200; MinLen = 5000; Match = 'bing' },
+        [pscustomobject]@{ Url = 'https://www.qq.com';    Code = 200; MinLen = 1000; Match = 'qq' },
+        [pscustomobject]@{ Url = 'https://www.baidu.com'; Code = 200; MinLen = 100;  Match = 'baidu' }
     )
+    # 校园网门户 / 认证页特征：出现这些说明其实还没认证（被网关劫持到了门户页）
+    $portalMarkers = 'Dr\.COMWebLoginID|eportal|Portal协议|无法获取用户认证|用户名或密码错误|id="login"'
     foreach ($t in $targets) {
         try {
             $req = [System.Net.HttpWebRequest]::Create($t.Url)
@@ -241,7 +249,11 @@ function Test-InternetOnline {
                 $sr.Dispose()
             } catch { }
             $resp.Close()
-            if ($code -eq $t.Code -and $body.Length -ge $t.MinLen) { return $true }
+            if ($code -eq $t.Code -and $body.Length -ge $t.MinLen) {
+                if ($body -match $portalMarkers) { continue }            # 被劫持到门户页
+                if ($t.Match -and $body -notmatch $t.Match) { continue } # 内容不对，疑似劫持页
+                return $true
+            }
         } catch { }
     }
     return $false
@@ -548,21 +560,31 @@ function Invoke-ConnectCycle {
         }
     }
 
-    $portalIp = Get-PortalIPv4 -Cfg $Cfg
-    $candidates = @(Get-NetCandidateList -PortalIp $portalIp)
-    if ($candidates.Count -eq 0) {
-        Write-CnLog '没有找到可用的物理网卡（网线未插、Wi-Fi 未连接？），本次放弃。' 'WARN'
-        return 1
-    }
-
     $password = Get-CnPassword -Cfg $Cfg
     $deadline = (Get-Date).AddMinutes($TimeoutMin)
     $attempt = 0
     $lastMsg = ''
     $portalSeen = $false
+    $noNicLogged = $false
 
     while ($true) {
         $attempt++
+
+        # 每轮都重新找网卡：如果这次跑得太早（网卡 / IP 还没就绪），下一轮会自己恢复。
+        # 旧版本在这里直接 return 1 放弃，这是"进了桌面偶尔还得手动连一次"的原因之一。
+        $portalIp = Get-PortalIPv4 -Cfg $Cfg
+        $candidates = @(Get-NetCandidateList -PortalIp $portalIp)
+        if ($candidates.Count -eq 0) {
+            $lastMsg = '还没找到可用的物理网卡'
+            if (-not $noNicLogged) {
+                Write-CnLog '还没找到可用的物理网卡（网线未插或 Wi-Fi 还没连上？），会继续重试。' 'WARN'
+                $noNicLogged = $true
+            }
+            if ((Get-Date) -ge $deadline) { break }
+            Start-Sleep -Seconds $IntervalSec
+            continue
+        }
+
         $used = $null
         $result = $null
 
@@ -624,6 +646,12 @@ function Invoke-ConnectCycle {
             if ($attempt -eq 1) {
                 Write-CnLog '当前看起来不在校园网范围内（连不上认证服务器），本次跳过。' 'WARN'
             }
+            # 给"网络刚起来、门户还没就绪"留几次机会；仍然连不上就提前结束本轮，
+            # 交给守护进程稍后重试（避免不在校园网时把整轮超时白跑满、刷日志）
+            if ($attempt -ge 3) {
+                Write-CnLog '连不上认证服务器，本轮提前结束，稍后自动重试。'
+                return 1
+            }
         }
 
         if ((Get-Date) -ge $deadline) { break }
@@ -640,14 +668,22 @@ function Invoke-ConnectCycle {
 
 # ---------- 同一时间只允许一个实例真正干活 ----------
 function Invoke-WithLock {
-    param([scriptblock]$Action)
+    param([scriptblock]$Action, [int]$WaitSeconds = 45)
     $created = $false
     $mtx = $null
     $got = $false
+    $t0 = Get-Date
     try {
         $mtx = New-Object System.Threading.Mutex($false, 'Local\CampusNetAutoLogin', [ref]$created)
-        $got = $mtx.WaitOne(0)
-        if (-not $got) { Write-Host '已有实例正在运行，本次跳过。'; return 0 }
+        # 旧版本是 WaitOne(0) 瞬时跳过且只写控制台，日志里查不到，出问题没法定位。
+        # 现在最多等 WaitSeconds 秒（并发触发时不会白跑一次），并记进日志。
+        $got = $mtx.WaitOne([Math]::Max(0, $WaitSeconds) * 1000)
+        if (-not $got) {
+            Write-CnLog "另一个实例运行超过 $WaitSeconds 秒仍未结束，本次跳过。" 'WARN'
+            return 0
+        }
+        $waited = ((Get-Date) - $t0).TotalSeconds
+        if ($waited -gt 1) { Write-CnLog ('等待前一个实例结束用了 {0} 秒。' -f [int]$waited) }
         return (& $Action)
     } finally {
         if ($mtx) {
@@ -674,9 +710,24 @@ try {
         $exitCode = 0
     }
     elseif ($Watch) {
+        # 守护进程单例：计划任务和启动文件夹可能同时拉起，只允许一个真正常驻。
+        # 有了它，计划任务也能安全地用 -Watch 启动：守护进程活着就退出，
+        # 被杀掉 / 崩溃了就自动补上（自愈），不必再依赖启动文件夹。
+        $watchCreated = $false
+        $watchMtx = $null
+        $watchGot = $false
+        try {
+            $watchMtx = New-Object System.Threading.Mutex($false, 'Local\CampusNetAutoLoginWatcher', [ref]$watchCreated)
+            $watchGot = $watchMtx.WaitOne(0)
+        } catch { }
+        if (-not $watchGot) {
+            Write-CnLog '已有守护进程在运行，本次不再重复启动。'
+            exit 0
+        }
+
         # 守护模式：监听网络变化事件（插网线 / 连 Wi-Fi / 睡眠唤醒 / DHCP 变化），
         # 一变就马上检查；另外每 60 秒用极轻的请求快查一次。
-        Write-CnLog '守护模式启动：监听网络变化，并每 60 秒轻量检查一次。'
+        Write-CnLog ("守护模式启动（v{0}）：监听网络变化，并每 60 秒轻量检查一次。" -f $script:CnVersion)
 
         $signal = New-Object System.Threading.ManualResetEvent($false)
         try {

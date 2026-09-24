@@ -35,7 +35,7 @@ $portalHost = 'lan.bistu.edu.cn'
 $portalPort = 801
 
 Write-Host ''
-Write-Host '=== 校园网自动登录 · 安装 ===' -ForegroundColor Cyan
+Write-Host '=== 校园网自动登录 · 安装 (v1.1.0) ===' -ForegroundColor Cyan
 
 function New-Shortcut {
     param([string]$Path, [string]$Target, [string]$Arguments, [string]$WorkDir, [string]$Icon, [string]$Description)
@@ -378,9 +378,9 @@ if (-not $SkipTask -and (Test-Path -LiteralPath $helper) -and $IntervalMinutes -
         $bootArgs = ' -BootScriptPath "{0}" -BootConfigPath "{1}" -BootIntervalMinutes {2}' -f $bootScript, $bootConfig, $IntervalMinutes
     }
     if ($targetVbs) {
-        $psArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ScriptPath "{1}" -LauncherPath "{2}" -IntervalMinutes {3}{4}' -f $helper, $targetScript, $targetVbs, $IntervalMinutes, $bootArgs
+        $psArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ScriptPath "{1}" -LauncherPath "{2}" -WatcherMode -IntervalMinutes {3}{4}' -f $helper, $targetScript, $targetVbs, $IntervalMinutes, $bootArgs
     } else {
-        $psArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ScriptPath "{1}" -IntervalMinutes {2}{3}' -f $helper, $targetScript, $IntervalMinutes, $bootArgs
+        $psArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ScriptPath "{1}" -WatcherMode -IntervalMinutes {2}{3}' -f $helper, $targetScript, $IntervalMinutes, $bootArgs
     }
     try {
         $proc = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList $psArgs
